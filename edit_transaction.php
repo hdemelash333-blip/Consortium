@@ -209,6 +209,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         // FIRST: Rollback the original transaction amount from budget calculations
         if ($budgetId && $originalAmount > 0) {
+            // Determine ETB-equivalent of the original amount using original currency and original/custom rates
+            $originalAmountETB = (float)$originalAmount;
+
+            // Find the original cluster from budget_data for accurate rates
+            $originalCluster = null;
+            try {
+                $origClusterStmt = $conn->prepare("SELECT cluster FROM budget_data WHERE id = :budgetId");
+                $origClusterStmt->execute([':budgetId' => $budgetId]);
+                $origClusterRow = $origClusterStmt->fetch(PDO::FETCH_ASSOC);
+                if ($origClusterRow && !empty($origClusterRow['cluster'])) {
+                    $originalCluster = $origClusterRow['cluster'];
+                }
+            } catch (Exception $e) {
+                // Non-fatal: fallback to posted cluster/default rates
+            }
+
+            // Build rates for original conversion
+            $ratesForOriginal = [];
+            if (!empty($customRatesData) && intval($customRatesData['use_custom_rate'] ?? 0) === 1) {
+                // Use the custom rates that were stored with this transaction
+                if (!empty($customRatesData['usd_to_etb'])) {
+                    $ratesForOriginal['USD_to_ETB'] = (float)$customRatesData['usd_to_etb'];
+                }
+                if (!empty($customRatesData['eur_to_etb'])) {
+                    $ratesForOriginal['EUR_to_ETB'] = (float)$customRatesData['eur_to_etb'];
+                }
+            } else {
+                // Use original cluster rates if available; otherwise use posted cluster rates/defaults
+                if (!empty($originalCluster)) {
+                    $ratesForOriginal = getCurrencyRatesByClusterNamePDO($conn, $originalCluster) ?: [];
+                }
+                if (empty($ratesForOriginal)) {
+                    $ratesForOriginal = !empty($currencyRates) ? $currencyRates : [
+                        'USD_to_ETB' => 55.0000,
+                        'EUR_to_ETB' => 60.0000
+                    ];
+                }
+            }
+
+            // Convert original amount to ETB
+            if (strtoupper($originalCurrency) === 'USD') {
+                $originalAmountETB = $originalAmount * ($ratesForOriginal['USD_to_ETB'] ?? 55.0000);
+            } elseif (strtoupper($originalCurrency) === 'EUR') {
+                $originalAmountETB = $originalAmount * ($ratesForOriginal['EUR_to_ETB'] ?? 60.0000);
+            } else { // ETB
+                $originalAmountETB = $originalAmount;
+            }
             // Get current budget data values
             $getBudgetQuery = "SELECT budget, actual, forecast, actual_plus_forecast, variance_percentage FROM budget_data WHERE id = :budgetId";
             $getBudgetStmt = $conn->prepare($getBudgetQuery);
@@ -218,10 +265,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $currentActual = $budgetData['actual'] ?? 0;
             $currentForecast = $budgetData['forecast'] ?? 0;
             
-            // Calculate new actual value (subtract the original amount)
-            $newActual = max(0, $currentActual - $originalAmount);
+            // Calculate new actual value (subtract the original amount in ETB)
+            $newActual = max(0, $currentActual - $originalAmountETB);
             // Add the original amount back to forecast to preserve user-entered base
-            $newForecast = max(0, ($currentForecast ?? 0) + $originalAmount);
+            $newForecast = max(0, ($currentForecast ?? 0) + $originalAmountETB);
             // Calculate new actual_plus_forecast using the recalculated forecast
             $newActualPlusForecast = $newActual + $newForecast;
             
@@ -478,7 +525,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
         
         // THIRD: Apply the new transaction amount to budget calculations
-        if ($amount > 0) {
+        if ($amountInETB > 0) {
             // Get the budget_id if not already available
             if (!$budgetId) {
                 // Find the correct budget_id based on category, quarter, and year
@@ -528,10 +575,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $currentActual = $budgetData['actual'] ?? 0;
                 $currentForecast = $budgetData['forecast'] ?? 0;
                 
-                // Calculate new actual value (add the new amount)
-                $newActual = max(0, $currentActual + $amount);
+                // Calculate new actual value (add the new amount in ETB)
+                $newActual = max(0, $currentActual + $amountInETB);
                 // Subtract only the delta from forecast to preserve user-entered base
-                $newForecast = max(0, ($currentForecast ?? 0) - $amount);
+                $newForecast = max(0, ($currentForecast ?? 0) - $amountInETB);
                 
                 // Calculate new actual_plus_forecast using recalculated forecast
                 $newActualPlusForecast = $newActual + $newForecast;
