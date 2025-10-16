@@ -1,9 +1,10 @@
 <?php
 session_start();
+ob_start();  // Start output buffering to catch any stray output
 
-// Enable error reporting for debugging
+// Enable error reporting for debugging (set to 0 in production)
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);  // Prevent HTML errors from polluting JSON; use error_log instead
 
 // Check if user is logged in
 if (!isset($_SESSION['user_id'])) {
@@ -33,6 +34,10 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
     error_log('Database transaction begun');
     
     try {
+        // Validate entry date early to avoid issues
+        $entryDate = null;
+        $year = null;
+        
         // Get transaction details before deletion to update budget_data including custom rate info
         $getTransactionQuery = "SELECT Amount, budget_id, CategoryName, QuarterPeriod, EntryDate, ACCEPTANCE, currency, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur FROM budget_preview WHERE PreviewID = ?";
         error_log('Query to get transaction: ' . $getTransactionQuery . ' with ID: ' . $transactionId);
@@ -71,7 +76,15 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
         $categoryName = trim($transaction['CategoryName'] ?? '');
         $quarterPeriod = trim($transaction['QuarterPeriod'] ?? '');
         $entryDate = $transaction['EntryDate'] ?? '';
-        $year = $entryDate ? intval(date('Y', strtotime($entryDate))) : null;
+        
+        // Validate and extract year
+        if ($entryDate && ($timestamp = strtotime($entryDate)) !== false) {
+            $year = intval(date('Y', $timestamp));
+        } else {
+            error_log("Invalid entry date for transaction ID: " . $transactionId);
+            throw new Exception("Invalid entry date for transaction");
+        }
+        
         $cluster = null;
 
         // Fetch cluster from budget_data if budgetId exists
@@ -89,80 +102,51 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             }
         }
 
-        // Build effective currency rates and compute adjustment in the SAME currency as the budget row
-        // Always include currency conversion helpers
-        include_once 'currency_functions.php';
-
-        // Determine effective rates: prefer transaction's persisted custom rates
+        // If transaction used custom rates, we must roll back using that original rate context
+        // Fetch persisted custom rates from the transaction row
         $customRates = [
             'use_custom_rate' => intval($transaction['use_custom_rate'] ?? 0),
             'usd_to_etb' => isset($transaction['usd_to_etb']) ? (float)$transaction['usd_to_etb'] : null,
             'eur_to_etb' => isset($transaction['eur_to_etb']) ? (float)$transaction['eur_to_etb'] : null,
             'usd_to_eur' => isset($transaction['usd_to_eur']) ? (float)$transaction['usd_to_eur'] : null,
         ];
-
-        // Fetch the target budget row to know its currency too
-        $budgetRowCurrency = 'ETB';
-        if ($budgetId > 0) {
-            $curStmt = $conn->prepare("SELECT currency FROM budget_data WHERE id = ?");
-            if ($curStmt) {
-                $curStmt->bind_param("i", $budgetId);
-                if ($curStmt->execute()) {
-                    $curRes = $curStmt->get_result();
-                    if ($cur = $curRes->fetch_assoc()) {
-                        $budgetRowCurrency = $cur['currency'] ?: 'ETB';
-                    }
-                }
-            }
-        }
-
-        // Start from cluster rates or sensible defaults
-        if ($cluster) {
-            $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $cluster);
-        }
-        if (empty($currencyRates)) {
-            $currencyRates = ['USD_to_ETB' => 55.0000, 'EUR_to_ETB' => 60.0000];
-        }
-
-        // Override with transaction's custom rates when flagged
+        
+        // Convert amount to USD for budget calculations using the same rates as when it was added
+        $amount = $originalAmount; // Default: assume already in USD
+        
         if ($customRates['use_custom_rate'] === 1) {
-            if (!empty($customRates['usd_to_etb'])) {
-                $currencyRates['USD_to_ETB'] = (float)$customRates['usd_to_etb'];
+            // Use the custom rates that were stored with this transaction
+            if ($transactionCurrency === 'ETB' && !empty($customRates['usd_to_etb'])) {
+                $amount = $originalAmount / $customRates['usd_to_etb']; // Convert ETB back to USD
+            } elseif ($transactionCurrency === 'EUR' && !empty($customRates['eur_to_etb']) && !empty($customRates['usd_to_etb'])) {
+                // Convert EUR -> ETB -> USD
+                $amountETB = $originalAmount * $customRates['eur_to_etb'];
+                $amount = $amountETB / $customRates['usd_to_etb'];
             }
-            if (!empty($customRates['eur_to_etb'])) {
-                $currencyRates['EUR_to_ETB'] = (float)$customRates['eur_to_etb'];
+        } else {
+            // Use standard cluster rates for conversion
+            include_once 'currency_functions.php';
+            if ($cluster) {
+                $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $cluster);
+            } else {
+                $currencyRates = ['USD_to_ETB' => 55.0000, 'EUR_to_ETB' => 60.0000];
+            }
+            
+            if ($transactionCurrency === 'ETB') {
+                $amount = $originalAmount / ($currencyRates['USD_to_ETB'] ?? 55.0000);
+            } elseif ($transactionCurrency === 'EUR') {
+                $amount = ($originalAmount * ($currencyRates['EUR_to_ETB'] ?? 60.0000)) / ($currencyRates['USD_to_ETB'] ?? 55.0000);
             }
         }
-
-        // Compute the adjustment in the budget row's currency
-        $adjustAmount = convertCurrency(
-            (float)$originalAmount,
-            strtoupper($transactionCurrency ?: 'ETB'),
-            strtoupper($budgetRowCurrency ?: 'ETB'),
-            $currencyRates
-        );
-
-        // Normalize numerical precision
-        $adjustAmount = (float)number_format($adjustAmount, 2, '.', '');
-
-        error_log(
-            sprintf(
-                'Delete transaction: original %.2f %s -> adjust %.2f %s (cluster=%s, custom=%d)',
-                $originalAmount,
-                $transactionCurrency,
-                $adjustAmount,
-                $budgetRowCurrency,
-                $cluster ?? 'NULL',
-                $customRates['use_custom_rate']
-            )
-        );
+        
+        error_log("Delete transaction: Original amount: $originalAmount $transactionCurrency, Converted amount for budget rollback: $amount USD");
 
         // FIRST: Rollback the transaction amount from budget calculations
-        if ($budgetId > 0 && $amountETB > 0 && $year && $categoryName) {
+        if ($budgetId > 0 && $amount > 0 && $year && $categoryName) {
             error_log("Rolling back budget data for budget ID: $budgetId, year: $year, category: $categoryName, cluster: " . ($cluster ?? 'NULL'));
 
             // Get current budget data
-            $getBudgetQuery = "SELECT actual, budget, forecast, actual_plus_forecast, cluster, currency FROM budget_data WHERE id = ?";
+            $getBudgetQuery = "SELECT actual, budget, forecast, actual_plus_forecast, cluster FROM budget_data WHERE id = ?";
             $getBudgetStmt = $conn->prepare($getBudgetQuery);
             if (!$getBudgetStmt) {
                 throw new Exception("Prepare failed for budget data lookup: " . $conn->error);
@@ -179,12 +163,11 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             $currentActual = floatval($budgetData['actual'] ?? 0);
             $currentBudget = floatval($budgetData['budget'] ?? 0);
             $currentForecast = floatval($budgetData['forecast'] ?? 0);
-            $budgetCurrency = $budgetData['currency'] ?: $budgetRowCurrency;
 
-            // Subtract adjustment from actual (never go below 0) - this is the rollback
-            $newActual = max(0, $currentActual - $adjustAmount);
-            // Add the deleted adjustment back to forecast to preserve user-entered base
-            $newForecast = max(0, $currentForecast + $adjustAmount);
+            // Subtract amount from actual (never go below 0) - this is the rollback
+            $newActual = max(0, $currentActual - $amount);
+            // Add the deleted amount back to forecast to preserve user-entered base
+            $newForecast = max(0, $currentForecast + $amount);
             $newActualPlusForecast = $newActual + $newForecast;
             $newVariancePercentage = 0;
             if ($currentBudget > 0) {
@@ -457,7 +440,8 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
     $response['message'] = "No transaction ID provided.";
 }
 
-// Return JSON response
+// Clean buffer and return JSON response
+ob_end_clean();
 header('Content-Type: application/json');
 echo json_encode($response);
 exit;
