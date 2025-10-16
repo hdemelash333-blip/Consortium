@@ -108,40 +108,56 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             'use_custom_rate' => intval($transaction['use_custom_rate'] ?? 0),
             'usd_to_etb' => isset($transaction['usd_to_etb']) ? (float)$transaction['usd_to_etb'] : null,
             'eur_to_etb' => isset($transaction['eur_to_etb']) ? (float)$transaction['eur_to_etb'] : null,
-            'usd_to_eur' => isset($transaction['usd_to_eur']) ? (float)$transaction['usd_to_eur'] : null,
-        ];
+            'usd        // CRITICAL FIX: Use the exact same conversion logic that was used when the transaction was added
+        // We need to convert the original amount using the same rates and logic as ajax_handler.php
         
-        // Convert amount to USD for budget calculations using the same rates as when it was added
-        $amount = $originalAmount; // Default: assume already in USD
+        include_once 'currency_functions.php';
         
+        // Get the target currency from the budget_data table (this is what the transaction was converted to)
+        $budgetCurrencyQuery = "SELECT currency FROM budget_data WHERE id = ?";
+        $budgetCurrencyStmt = $conn->prepare($budgetCurrencyQuery);
+        $budgetCurrencyStmt->bind_param("i", $budgetId);
+        $budgetCurrencyStmt->execute();
+        $budgetCurrencyResult = $budgetCurrencyStmt->get_result();
+        $budgetCurrencyData = $budgetCurrencyResult->fetch_assoc();
+        $targetCurrency = $budgetCurrencyData['currency'] ?? 'ETB';
+        
+        // Get currency rates (same logic as ajax_handler.php)
+        $currencyRates = [];
         if ($customRates['use_custom_rate'] === 1) {
             // Use the custom rates that were stored with this transaction
-            if ($transactionCurrency === 'ETB' && !empty($customRates['usd_to_etb'])) {
-                $amount = $originalAmount / $customRates['usd_to_etb']; // Convert ETB back to USD
-            } elseif ($transactionCurrency === 'EUR' && !empty($customRates['eur_to_etb']) && !empty($customRates['usd_to_etb'])) {
-                // Convert EUR -> ETB -> USD
-                $amountETB = $originalAmount * $customRates['eur_to_etb'];
-                $amount = $amountETB / $customRates['usd_to_etb'];
-            }
+            $currencyRates = [
+                'USD_to_ETB' => $customRates['usd_to_etb'] ?? 55.0000,
+                'EUR_to_ETB' => $customRates['eur_to_etb'] ?? 60.0000,
+                'USD_to_EUR' => $customRates['usd_to_eur'] ?? 0.9375
+            ];
         } else {
             // Use standard cluster rates for conversion
-            include_once 'currency_functions.php';
             if ($cluster) {
                 $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $cluster);
             } else {
-                $currencyRates = ['USD_to_ETB' => 55.0000, 'EUR_to_ETB' => 60.0000];
-            }
-            
-            if ($transactionCurrency === 'ETB') {
-                $amount = $originalAmount / ($currencyRates['USD_to_ETB'] ?? 55.0000);
-            } elseif ($transactionCurrency === 'EUR') {
-                $amount = ($originalAmount * ($currencyRates['EUR_to_ETB'] ?? 60.0000)) / ($currencyRates['USD_to_ETB'] ?? 55.0000);
+                $currencyRates = ['USD_to_ETB' => 55.0000, 'EUR_to_ETB' => 60.0000, 'USD_to_EUR' => 0.9375];
             }
         }
         
-        error_log("Delete transaction: Original amount: $originalAmount $transactionCurrency, Converted amount for budget rollback: $amount USD");
-
-        // FIRST: Rollback the transaction amount from budget calculations
+        // Convert the original amount from its currency to ETB first, then to target currency
+        // This matches the exact logic used in ajax_handler.php
+        $amountETB = $originalAmount; // Default: assume already in ETB
+        
+        if ($transactionCurrency === 'USD') {
+            $amountETB = $originalAmount * ($currencyRates['USD_to_ETB'] ?? 55.0000);
+        } elseif ($transactionCurrency === 'EUR') {
+            $amountETB = $originalAmount * ($currencyRates['EUR_to_ETB'] ?? 60.0000);
+        }
+        
+        // Now convert from ETB to target currency (same as ajax_handler.php)
+        $amount = convertCurrency($amountETB, 'ETB', $targetCurrency, $currencyRates);
+        
+        error_log("Delete transaction: Original amount: $originalAmount $transactionCurrency, Amount in ETB: $amountETB, Converted to target currency ($targetCurrency): $amount");ount = ($originalAmount * ($currencyRates['EUR_to_ETB'] ?? 60.0000)) / ($currencyRates['USD_to_ETB'] ?? 55.0000);
+            }
+        }
+        
+        error_log("Delete transact        // FIRST: Rollback the transaction amount from budget calculations
         if ($budgetId > 0 && $amount > 0 && $year && $categoryName) {
             error_log("Rolling back budget data for budget ID: $budgetId, year: $year, category: $categoryName, cluster: " . ($cluster ?? 'NULL'));
 
@@ -164,6 +180,10 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             $currentBudget = floatval($budgetData['budget'] ?? 0);
             $currentForecast = floatval($budgetData['forecast'] ?? 0);
 
+            // CRITICAL FIX: Use the exact amount that was added to budget calculations
+            // The amount variable already contains the USD amount that was used in budget calculations
+            // We need to reverse this exact amount, not convert the original transaction amount again
+            
             // Subtract amount from actual (never go below 0) - this is the rollback
             $newActual = max(0, $currentActual - $amount);
             // Add the deleted amount back to forecast to preserve user-entered base
@@ -173,7 +193,7 @@ if (isset($_GET['id']) && !empty($_GET['id'])) {
             if ($currentBudget > 0) {
                 // Variance (%) = (Budget − Actual) / Budget × 100
                 $newVariancePercentage = round((($currentBudget - $newActual) / abs($currentBudget)) * 100, 2);
-            } elseif ($currentBudget == 0 && $newActual > 0) {
+            } elseif ($cur            error_log("Budget rollback: Current actual: $currentActual, Current forecast: $currentForecast, Amount to reverse: $amount, New actual: $newActual, New forecast: $newForecast"); } elseif ($currentBudget == 0 && $newActual > 0) {
                 $newVariancePercentage = -100.00;
             }
 
