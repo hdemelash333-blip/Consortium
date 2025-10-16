@@ -204,24 +204,8 @@ try {
             $budgetId = $quarterBudgetData['id'] ?? null;
             $targetCurrency = $quarterBudgetData['currency'] ?? 'ETB'; // Default to ETB if not set
             
-            // Convert amount from ETB to target currency for budget_preview
+            // Convert amount from ETB to target currency
             $amount = convertCurrency($amountETB, 'ETB', $targetCurrency, $currencyRates);
-            
-            // Store the original ETB amount for budget_preview Amount field
-            $originalAmountETB = $amountETB;
-            
-            // For budget_data updates, we need the amount in the budget's native currency
-            // If custom rates are used, we should use the standard rates for budget_data calculations
-            $budgetDataAmount = $amountETB; // Always use ETB amount for budget_data
-            if ($targetCurrency !== 'ETB') {
-                // Convert using standard rates for budget_data consistency
-                $standardRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster) ?: [
-                    'USD_to_ETB' => 55.0000,
-                    'EUR_to_ETB' => 60.0000,
-                    'USD_to_EUR' => 0.9375
-                ];
-                $budgetDataAmount = convertCurrency($amountETB, 'ETB', $targetCurrency, $standardRates);
-            }
             
             // Set budget tracking values for budget_preview table (use values as-is from budget_data)
             $quarterPeriod = $quarterBudgetData['period_name'] ?? 'Unknown';
@@ -288,7 +272,7 @@ try {
                 'description' => $description,
                 'partner' => $partner,
                 'entryDate' => $entryDate,
-                'amount' => $originalAmountETB,
+                'amount' => $amount,
                 'pvNumber' => $pvNumber,
                 'documentPathsStr' => $documentPathsStr,
                 'documentTypesStr' => $documentTypesStr,
@@ -326,10 +310,10 @@ try {
                 $usdToEurPersist = $usdToEurPersist ?? null;
                 
                 // Count actual parameters being passed
-                $params = [$budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $originalAmountETB, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist];
+                $params = [$budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist];
                 error_log('DEBUG - Actual parameter count: ' . count($params));
                 
-                $stmt->bind_param("sssssssdssssssssddssisssiddd", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $originalAmountETB, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist);
+                $stmt->bind_param("sssssssdssssssssddssisssiddd", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist);
             } else {
                 error_log('DEBUG - hasRatesCols=false, variables: ' . json_encode($debugVars));
                 $typeString = "sssssssdssssssssddssisss";
@@ -337,7 +321,7 @@ try {
                 error_log('DEBUG - Parameter count: 24');
                 
                 // Legacy binding without the extra columns - EXACT COPY of old working code
-                $stmt->bind_param("sssssssdssssssssddssisss", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $originalAmountETB, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString);
+                $stmt->bind_param("sssssssdssssssssddssisss", $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner, $entryDate, $amount, $pvNumber, $documentPathsStr, $documentTypesStr, $originalNamesStr, $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent, $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $emptyString, $emptyString);
             }
             
             error_log('AJAX Handler - Executing statement');
@@ -387,13 +371,7 @@ try {
                 $availableBudget = max((float)($budgetCheckData['budget'] ?? 0) - (float)($budgetCheckData['actual'] ?? 0), 0);
                 
                 // Convert the entered amount to the same currency as the budget for comparison
-                // For budget_data updates, always use standard rates to maintain consistency
-                $standardRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster) ?: [
-                    'USD_to_ETB' => 55.0000,
-                    'EUR_to_ETB' => 60.0000,
-                    'USD_to_EUR' => 0.9375
-                ];
-                $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $budgetCurrency, $standardRates);
+                $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $budgetCurrency, $currencyRates);
                 
                 // Allow saving transactions even if budget is exceeded
                 // Comment out the budget validation check
@@ -825,8 +803,30 @@ try {
                 ];
             }
             
+            // If transaction used custom rates, we must roll back using that original rate context
+            // Fetch persisted custom rates from the transaction row
+            $customRates = [
+                'use_custom_rate' => intval($transaction['use_custom_rate'] ?? 0),
+                'usd_to_etb' => isset($transaction['usd_to_etb']) ? (float)$transaction['usd_to_etb'] : null,
+                'eur_to_etb' => isset($transaction['eur_to_etb']) ? (float)$transaction['eur_to_etb'] : null,
+                'usd_to_eur' => isset($transaction['usd_to_eur']) ? (float)$transaction['usd_to_eur'] : null,
+            ];
+            
+            // Override with custom rates if they were used for this transaction
+            if ($customRates['use_custom_rate'] === 1) {
+                if (!empty($customRates['usd_to_etb'])) {
+                    $currencyRates['USD_to_ETB'] = $customRates['usd_to_etb'];
+                }
+                if (!empty($customRates['eur_to_etb'])) {
+                    $currencyRates['EUR_to_ETB'] = $customRates['eur_to_etb'];
+                }
+                if (!empty($customRates['usd_to_eur'])) {
+                    $currencyRates['USD_to_EUR'] = $customRates['usd_to_eur'];
+                }
+            }
+            
             // First, get the transaction details before deleting
-            $getTransactionQuery = "SELECT bp.Amount, bp.CategoryName, bp.EntryDate, bp.QuarterPeriod, bp.currency, bd.id as budget_id, bd.year2 
+            $getTransactionQuery = "SELECT bp.Amount, bp.CategoryName, bp.EntryDate, bp.QuarterPeriod, bp.currency, bp.use_custom_rate, bp.usd_to_etb, bp.eur_to_etb, bd.id as budget_id, bd.year2 
                                   FROM budget_preview bp 
                                   LEFT JOIN budget_data bd ON bp.budget_id = bd.id 
                                   WHERE bp.PreviewID = ?";
@@ -856,6 +856,9 @@ try {
             $entryDate = $transaction['EntryDate'];
             $quarterPeriod = $transaction['QuarterPeriod'];
             $transactionCurrency = $transaction['currency'] ?? 'ETB';
+            $useCustomRate = $transaction['use_custom_rate'] ?? 0;
+            $customUsdToEtb = $transaction['usd_to_etb'] ?? null;
+            $customEurToEtb = $transaction['eur_to_etb'] ?? null;
             $budgetId = $transaction['budget_id'];
             $year = $transaction['year2'];
             
@@ -882,6 +885,24 @@ try {
                 
                 // Update the budget_data table to reduce actual spending and add the deleted amount back to forecast for the quarter
                 if ($budgetId) {
+                    // Get the currency of the budget_data row to ensure we're using the correct currency for calculations
+                    $budgetCurrency = 'ETB'; // Default
+                    if ($budgetId > 0) {
+                        $budgetCurrencyStmt = $conn->prepare("SELECT currency FROM budget_data WHERE id = ?");
+                        if ($budgetCurrencyStmt) {
+                            $budgetCurrencyStmt->bind_param("i", $budgetId);
+                            if ($budgetCurrencyStmt->execute()) {
+                                $budgetCurrencyResult = $budgetCurrencyStmt->get_result();
+                                if ($budgetCurrencyRow = $budgetCurrencyResult->fetch_assoc()) {
+                                    $budgetCurrency = $budgetCurrencyRow['currency'] ?: 'ETB';
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Convert the original transaction amount to the budget currency using the same rates that were used when adding
+                    $amountInBudgetCurrency = convertCurrency($amount, $transactionCurrency, $budgetCurrency, $currencyRates);
+                    
                     $updateBudgetQuery = "UPDATE budget_data SET 
                         actual = GREATEST(COALESCE(actual, 0) - ?, 0),
                         forecast = COALESCE(forecast, 0) + ?,
@@ -889,7 +910,7 @@ try {
                         WHERE id = ?";
                     
                     $updateStmt = $conn->prepare($updateBudgetQuery);
-                    $updateStmt->bind_param("ddi", $amount, $amount, $budgetId);
+                    $updateStmt->bind_param("ddi", $amountInBudgetCurrency, $amountInBudgetCurrency, $budgetId);
                     
                     if (!$updateStmt->execute()) {
                         throw new Exception("Failed to update budget data: " . $updateStmt->error);
