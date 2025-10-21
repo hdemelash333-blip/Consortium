@@ -122,17 +122,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $originalAmount = (float)$transaction['Amount'];  // 9-decimal precision from DB
    
     // Convert the ETB amount back to the original currency
-    $amount = convertCurrency($amountInETB, 'ETB', $originalCurrency, $currencyRates);
-    // Round to 9 decimals to match DB precision
-    $amount = round($amount, 9);
-   
-    $tolerance = 1e-9;  // Tiny threshold for float noise
-    if (abs($amount - $originalAmount) > $tolerance) {
-        // Rare drift case: Suggest rounded ETB alternatives (e.g., ±0.01)
-        $expectedETB = round($originalAmount * ($currencyRates[strtoupper($originalCurrency) . '_to_ETB'] ?? 157.9640), 2);
-        $lowerETB = round($expectedETB - 0.01, 2);
-        $higherETB = number_format($expectedETB + 1e-10, 9);
-        $error_message = "Amount precision drift detected (common with exchange rates). Please enter nearest ETB value: {$lowerETB} or {$higherETB}.";
+    $amount = convertCurrency($amountInETB, 'ETB'    // Allow amount changes - only validate for reasonable bounds
+    if ($amount < 0) {
+        $error_message = "Amount cannot be negative.";
+    } else if ($amount > 999999999.99) {
+        $error_message = "Amount exceeds maximum allowed value.";
+    } = "Amount precision drift detected (common with exchange rates). Please enter nearest ETB value: {$lowerETB} or {$higherETB}.";
     }
    
     // These values are calculated automatically and should not be taken from user input
