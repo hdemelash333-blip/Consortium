@@ -1,23 +1,18 @@
 <?php
 session_start();
-
 // Check if user is logged in
 if (!isset($_SESSION['user_id'])) {
     header("Location: login.php");
     exit();
 }
-
 // Include database configuration
 require_once 'config.php'; // Use PDO connection instead of setup_database.php
 require_once 'currency_functions_pdo.php'; // Include PDO-compatible currency functions
-
 // Initialize variables
 $error_message = '';
 $success_message = '';
-
 // Get transaction ID from URL
 $previewId = isset($_GET['id']) ? intval($_GET['id']) : 0;
-
 // Fetch transaction data for display (only if not redirecting)
 if ($previewId > 0) {
     try {
@@ -25,13 +20,13 @@ if ($previewId > 0) {
         $stmt = $conn->prepare($query);
         $stmt->execute([':previewId' => $previewId]);
         $transaction = $stmt->fetch(PDO::FETCH_ASSOC);
-        
+       
         if (!$transaction) {
             $_SESSION['error_message'] = "Transaction not found.";
             header("Location: history.php");
             exit();
         }
-        
+       
         // Get currency rates for the transaction's cluster
         $currencyRates = [];
         if (!empty($transaction['cluster'])) {
@@ -40,13 +35,12 @@ if ($previewId > 0) {
             // Default rates if no cluster is assigned
             $currencyRates = [
                 'USD_to_ETB' => 55.0000,
-                'EUR_to_ETB' => 60.0000
+                'EUR_to_ETB' => 157.9640  // Updated with provided rate
             ];
         }
-        
+       
         // Get the original currency of the transaction from the database
         $originalCurrency = $transaction['currency'] ?? 'USD'; // Default to USD if not set
-
         // If this transaction used custom rates, prefer those for conversions
         if (!empty($transaction['use_custom_rate']) && intval($transaction['use_custom_rate']) === 1) {
             if (!empty($transaction['usd_to_etb'])) {
@@ -56,10 +50,13 @@ if ($previewId > 0) {
                 $currencyRates['EUR_to_ETB'] = (float)$transaction['eur_to_etb'];
             }
         }
-        
+       
         // Convert the amount to ETB for display
         $amountInETB = convertCurrency($transaction['Amount'], $originalCurrency, 'ETB', $currencyRates);
-        
+        // Round ETB to 2 decimals for user input/display
+        $amountInETB = round($amountInETB, 2);
+        $displayETB = number_format($amountInETB, 2, '.', '');  // e.g., "20025.15"
+       
     } catch (PDOException $e) {
         $_SESSION['error_message'] = "Error fetching transaction: " . $e->getMessage();
         header("Location: history.php");
@@ -70,7 +67,6 @@ if ($previewId > 0) {
     header("Location: history.php");
     exit();
 }
-
 // Check if form is submitted
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Get form data
@@ -82,12 +78,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $partner = $_POST['partner'] ?? '';
     $entryDate = $_POST['entry_date'] ?? '';
     $amountInETB = $_POST['amount'] ?? 0; // This is the ETB amount entered by user
+    // Round user input to 2 decimals (ETB precision)
+    $amountInETB = round((float)$amountInETB, 2);
     $pvNumber = $_POST['pv_number'] ?? '';
     $quarterPeriod = $_POST['quarter_period'] ?? '';
     $categoryName = $_POST['category_name'] ?? '';
     $cluster = $_POST['cluster'] ?? '';
     $budgetId = $_POST['budget_id'] ?? null;
-    
+   
     // Get currency rates for conversion
     $currencyRates = [];
     if (!empty($cluster)) {
@@ -96,10 +94,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Default rates if no cluster is assigned
         $currencyRates = [
             'USD_to_ETB' => 55.0000,
-            'EUR_to_ETB' => 60.0000
+            'EUR_to_ETB' => 157.9640  // Updated with provided rate
         ];
     }
-    
+   
     // If original transaction had custom rates, override the rates used for conversion during edit
     $customRatesQuery = "SELECT use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur, currency FROM budget_preview WHERE PreviewID = :previewId";
     $customRatesStmt = $conn->prepare($customRatesQuery);
@@ -113,61 +111,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $currencyRates['EUR_to_ETB'] = (float)$customRatesData['eur_to_etb'];
         }
     }
-
     // Get the original currency from the database
     $currencyDataQuery = "SELECT currency FROM budget_preview WHERE PreviewID = :previewId";
     $currencyStmt = $conn->prepare($currencyDataQuery);
     $currencyStmt->execute([':previewId' => $previewId]);
     $currencyData = $currencyStmt->fetch(PDO::FETCH_ASSOC);
     $originalCurrency = $currencyData['currency'] ?? 'USD'; // Default to USD if not set
-    
+   
+    // Get original for tolerance check
+    $originalAmount = (float)$transaction['Amount'];  // 9-decimal precision from DB
+   
     // Convert the ETB amount back to the original currency
     $amount = convertCurrency($amountInETB, 'ETB', $originalCurrency, $currencyRates);
-    
+    // Round to 9 decimals to match DB precision
+    $amount = round($amount, 9);
+   
+    $tolerance = 1e-9;  // Tiny threshold for float noise
+    if (abs($amount - $originalAmount) > $tolerance) {
+        // Rare drift case: Suggest rounded ETB alternatives (e.g., ±0.01)
+        $expectedETB = round($originalAmount * ($currencyRates[strtoupper($originalCurrency) . '_to_ETB'] ?? 157.9640), 2);
+        $lowerETB = round($expectedETB - 0.01, 2);
+        $higherETB = number_format($expectedETB + 1e-10, 9);
+        $error_message = "Amount precision drift detected (common with exchange rates). Please enter nearest ETB value: {$lowerETB} or {$higherETB}.";
+    }
+   
     // These values are calculated automatically and should not be taken from user input
     // $originalBudget = $_POST['original_budget'] ?? 0;
     // $remainingBudget = $_POST['remaining_budget'] ?? 0;
     // $actualSpent = $_POST['actual_spent'] ?? 0;
     // $forecastAmount = $_POST['forecast_amount'] ?? 0;
-    
+   
     // Handle document data
     $documentTypes = $_POST['document_types'] ?? [];
     $documentFiles = $_FILES['document_files'] ?? [];
     $existingDocumentPaths = $_POST['existing_document_paths'] ?? [];
-    
+   
     // Format document data as JSON for the Documents field
     $documentsArray = [];
     for ($i = 0; $i < count($documentTypes); $i++) {
         if (empty($documentTypes[$i])) {
             continue;
         }
-        
+       
         $serverPath = '';
         $filename = '';
-        
+       
         // Check if there's an existing document path
         if (isset($existingDocumentPaths[$i]) && !empty($existingDocumentPaths[$i])) {
             $serverPath = $existingDocumentPaths[$i];
             $filename = basename($serverPath);
         }
-        
+       
         // Check if a new file was uploaded
         if (isset($documentFiles['tmp_name'][$i]) && !empty($documentFiles['tmp_name'][$i])) {
             $uploadDir = 'admin/documents/';
             if (!is_dir($uploadDir)) {
                 mkdir($uploadDir, 0777, true);
             }
-            
+           
             $fileExtension = pathinfo($documentFiles['name'][$i], PATHINFO_EXTENSION);
             $filename = uniqid() . '_' . time() . '.' . $fileExtension;
             $serverPath = $uploadDir . $filename;
-            
+           
             if (!move_uploaded_file($documentFiles['tmp_name'][$i], $serverPath)) {
                 $error_message = "Error uploading file: " . $documentFiles['name'][$i];
                 break;
             }
         }
-        
+       
         if (!empty($serverPath)) {
             $documentsArray[] = [
                 'documentType' => $documentTypes[$i],
@@ -176,9 +187,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ];
         }
     }
-    
+   
     $documentsJson = !empty($documentsArray) ? json_encode($documentsArray) : null;
-    
+   
     // Format document data as comma-separated strings for other fields
     $documentTypesStr = !empty($documentTypes) ? implode(',', $documentTypes) : null;
     $documentPathsStr = '';
@@ -186,7 +197,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $paths = array_column($documentsArray, 'serverPath');
         $documentPathsStr = implode(',', $paths);
     }
-    
+   
     // Before executing the update, get original transaction data to calculate the difference
     try {
         $originalDataQuery = "SELECT Amount, budget_id, CategoryName, QuarterPeriod, EntryDate FROM budget_preview WHERE PreviewID = :previewId";
@@ -202,371 +213,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } catch (PDOException $e) {
         $error_message = "Error fetching original transaction data: " . $e->getMessage();
     }
-
     // Begin transaction for database consistency
-    try {
-        $conn->beginTransaction();
-        
-        // FIRST: Rollback the original transaction amount from budget calculations
-        if ($budgetId && $originalAmount > 0) {
-            // Determine ETB-equivalent of the original amount using original currency and original/custom rates
-            $originalAmountETB = (float)$originalAmount;
-
-            // Find the original cluster from budget_data for accurate rates
-            $originalCluster = null;
-            try {
-                $origClusterStmt = $conn->prepare("SELECT cluster FROM budget_data WHERE id = :budgetId");
-                $origClusterStmt->execute([':budgetId' => $budgetId]);
-                $origClusterRow = $origClusterStmt->fetch(PDO::FETCH_ASSOC);
-                if ($origClusterRow && !empty($origClusterRow['cluster'])) {
-                    $originalCluster = $origClusterRow['cluster'];
-                }
-            } catch (Exception $e) {
-                // Non-fatal: fallback to posted cluster/default rates
-            }
-
-            // Build rates for original conversion
-            $ratesForOriginal = [];
-            if (!empty($customRatesData) && intval($customRatesData['use_custom_rate'] ?? 0) === 1) {
-                // Use the custom rates that were stored with this transaction
-                if (!empty($customRatesData['usd_to_etb'])) {
-                    $ratesForOriginal['USD_to_ETB'] = (float)$customRatesData['usd_to_etb'];
-                }
-                if (!empty($customRatesData['eur_to_etb'])) {
-                    $ratesForOriginal['EUR_to_ETB'] = (float)$customRatesData['eur_to_etb'];
-                }
-            } else {
-                // Use original cluster rates if available; otherwise use posted cluster rates/defaults
-                if (!empty($originalCluster)) {
-                    $ratesForOriginal = getCurrencyRatesByClusterNamePDO($conn, $originalCluster) ?: [];
-                }
-                if (empty($ratesForOriginal)) {
-                    $ratesForOriginal = !empty($currencyRates) ? $currencyRates : [
-                        'USD_to_ETB' => 55.0000,
-                        'EUR_to_ETB' => 60.0000
-                    ];
-                }
-            }
-
-            // Convert original amount to ETB
-            if (strtoupper($originalCurrency) === 'USD') {
-                $originalAmountETB = $originalAmount * ($ratesForOriginal['USD_to_ETB'] ?? 55.0000);
-            } elseif (strtoupper($originalCurrency) === 'EUR') {
-                $originalAmountETB = $originalAmount * ($ratesForOriginal['EUR_to_ETB'] ?? 60.0000);
-            } else { // ETB
-                $originalAmountETB = $originalAmount;
-            }
-            // Get current budget data values
-            $getBudgetQuery = "SELECT budget, actual, forecast, actual_plus_forecast, variance_percentage FROM budget_data WHERE id = :budgetId";
-            $getBudgetStmt = $conn->prepare($getBudgetQuery);
-            $getBudgetStmt->execute([':budgetId' => $budgetId]);
-            $budgetData = $getBudgetStmt->fetch(PDO::FETCH_ASSOC);
-            $currentBudget = $budgetData['budget'] ?? 0;
-            $currentActual = $budgetData['actual'] ?? 0;
-            $currentForecast = $budgetData['forecast'] ?? 0;
-            
-            // Calculate new actual value (subtract the original amount in ETB)
-            $newActual = max(0, $currentActual - $originalAmountETB);
-            // Add the original amount back to forecast to preserve user-entered base
-            $newForecast = max(0, ($currentForecast ?? 0) + $originalAmountETB);
-            // Calculate new actual_plus_forecast using the recalculated forecast
-            $newActualPlusForecast = $newActual + $newForecast;
-            
-            // Calculate new variance percentage using the requested formula
-            // Variance (%) = (Budget − Actual) / Budget × 100
-            $newVariancePercentage = 0;
-            if ($currentBudget > 0) {
-                $newVariancePercentage = round((($currentBudget - $newActual) / abs($currentBudget)) * 100, 2);
-            } else if ($currentBudget == 0 && $newActual > 0) {
-                $newVariancePercentage = -100.00;
-            }
-            
-            // Update the specific quarter row in budget_data including recalculated forecast
-            $updateBudgetQuery = "UPDATE budget_data SET 
-                actual = :actual,
-                forecast = :forecast,
-                actual_plus_forecast = :actualPlusForecast,
-                variance_percentage = :variancePercentage
-                WHERE id = :budgetId";
-            $updateStmt = $conn->prepare($updateBudgetQuery);
-            $updateStmt->execute([
-                ':actual' => $newActual,
-                ':forecast' => $newForecast,
-                ':actualPlusForecast' => $newActualPlusForecast,
-                ':variancePercentage' => $newVariancePercentage,
-                ':budgetId' => $budgetId
-            ]);
-            
-            // Extract year and cluster for further updates
-            $extractYearQuery = "SELECT year2, cluster FROM budget_data WHERE id = :budgetId";
-            $extractYearStmt = $conn->prepare($extractYearQuery);
-            $extractYearStmt->execute([':budgetId' => $budgetId]);
-            $extractYearData = $extractYearStmt->fetch(PDO::FETCH_ASSOC);
-            $year = $extractYearData['year2'] ?? $originalYear;
-            $cluster = $extractYearData['cluster'] ?? null;
-            
-            if ($year && $originalCategoryName) {
-                // Update Annual Total row - recalculate the sum of quarterly actuals
-                $updateAnnualQuery = "UPDATE budget_data 
-                    SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b 
-                                WHERE b.year2 = :year AND b.category_name = :categoryName 
-                                AND b.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
-                
-                $annualParams = [
-                    ':year' => $year,
-                    ':categoryName' => $originalCategoryName
-                ];
-                
-                if ($cluster) {
-                    $updateAnnualQuery .= " AND b.cluster = :cluster";
-                    $annualParams[':cluster'] = $cluster;
-                }
-                $updateAnnualQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
-                
-                $annualParams[':year2'] = $year;
-                $annualParams[':categoryName2'] = $originalCategoryName;
-                
-                if ($cluster) {
-                    $annualParams[':cluster2'] = $cluster;
-                    $updateAnnualQuery .= " AND cluster = :cluster2";
-                }
-                
-                $updateAnnualStmt = $conn->prepare($updateAnnualQuery);
-                $updateAnnualStmt->execute($annualParams);
-                
-                // Sync Annual Total forecast as the sum of quarterly forecasts
-                $updateAnnualForecastSumQuery = "UPDATE budget_data 
-                    SET forecast = (
-                        SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b 
-                        WHERE b.year2 = :year AND b.category_name = :categoryName 
-                        AND b.period_name IN ('Q1','Q2','Q3','Q4')";
-                $annualForecastParams = [
-                    ':year' => $year,
-                    ':categoryName' => $originalCategoryName
-                ];
-                if ($cluster) {
-                    $updateAnnualForecastSumQuery .= " AND b.cluster = :cluster";
-                    $annualForecastParams[':cluster'] = $cluster;
-                }
-                $updateAnnualForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
-                $annualForecastParams[':year2'] = $year;
-                $annualForecastParams[':categoryName2'] = $originalCategoryName;
-                if ($cluster) {
-                    $updateAnnualForecastSumQuery .= " AND cluster = :cluster2";
-                    $annualForecastParams[':cluster2'] = $cluster;
-                }
-                $updateAnnualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
-                $updateAnnualForecastSumStmt->execute($annualForecastParams);
-
-                // Update actual_plus_forecast for Annual Total
-                $updateAnnualActualForecastQuery = "UPDATE budget_data 
-                    SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                    WHERE year2 = :year AND category_name = :categoryName AND period_name = 'Annual Total'";
-                
-                $actualForecastParams = [
-                    ':year' => $year,
-                    ':categoryName' => $originalCategoryName
-                ];
-                
-                if ($cluster) {
-                    $updateAnnualActualForecastQuery .= " AND cluster = :cluster";
-                    $actualForecastParams[':cluster'] = $cluster;
-                }
-                
-                $updateAnnualActualForecastStmt = $conn->prepare($updateAnnualActualForecastQuery);
-                $updateAnnualActualForecastStmt->execute($actualForecastParams);
-                
-                // Update variance percentages
-                $updateVarianceQuery = "UPDATE budget_data 
-                    SET variance_percentage = CASE 
-                        WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
-                        WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
-                        ELSE 0.00 
-                    END
-                    WHERE year2 = :year AND category_name = :categoryName";
-                
-                $varianceParams = [
-                    ':year' => $year,
-                    ':categoryName' => $originalCategoryName
-                ];
-                
-                if ($cluster) {
-                    $updateVarianceQuery .= " AND cluster = :cluster";
-                    $varianceParams[':cluster'] = $cluster;
-                }
-                
-                $updateVarianceStmt = $conn->prepare($updateVarianceQuery);
-                $updateVarianceStmt->execute($varianceParams);
-                
-                // Finally, update the Total row
-                // Calculate new actual for Total row
-                $updateTotalQuery = "UPDATE budget_data 
-                    SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b 
-                                WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
-                
-                $totalParams = [
-                    ':year' => $year
-                ];
-                
-                if ($cluster) {
-                    $updateTotalQuery .= " AND b.cluster = :cluster";
-                    $totalParams[':cluster'] = $cluster;
-                }
-                $updateTotalQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
-                
-                $totalParams[':year2'] = $year;
-                
-                if ($cluster) {
-                    $totalParams[':cluster2'] = $cluster;
-                    $updateTotalQuery .= " AND cluster = :cluster2";
-                }
-                
-                $updateTotalStmt = $conn->prepare($updateTotalQuery);
-                $updateTotalStmt->execute($totalParams);
-                
-                // Sync Total forecast as sum of Annual Total forecasts across categories
-                $updateTotalForecastSumQuery = "UPDATE budget_data 
-                    SET forecast = (
-                        SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b 
-                        WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
-                $totalForecastParams = [
-                    ':year' => $year
-                ];
-                if ($cluster) {
-                    $updateTotalForecastSumQuery .= " AND b.cluster = :cluster";
-                    $totalForecastParams[':cluster'] = $cluster;
-                }
-                $updateTotalForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
-                $totalForecastParams[':year2'] = $year;
-                if ($cluster) {
-                    $updateTotalForecastSumQuery .= " AND cluster = :cluster2";
-                    $totalForecastParams[':cluster2'] = $cluster;
-                }
-                $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
-                $updateTotalForecastSumStmt->execute($totalForecastParams);
-
-                // Update actual_plus_forecast for Total row
-                $updateTotalActualForecastQuery = "UPDATE budget_data 
-                    SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                    WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
-                
-                $totalActualForecastParams = [
-                    ':year' => $year
-                ];
-                
-                if ($cluster) {
-                    $updateTotalActualForecastQuery .= " AND cluster = :cluster";
-                    $totalActualForecastParams[':cluster'] = $cluster;
-                }
-                
-                $updateTotalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
-                $updateTotalActualForecastStmt->execute($totalActualForecastParams);
-                
-                // Update variance for Total row
-                $updateTotalVarianceQuery = "UPDATE budget_data 
-                    SET variance_percentage = CASE 
-                        WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
-                        WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
-                        ELSE 0.00 
-                    END
-                    WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
-                
-                $totalVarianceParams = [
-                    ':year' => $year
-                ];
-                
-                if ($cluster) {
-                    $updateTotalVarianceQuery .= " AND cluster = :cluster";
-                    $totalVarianceParams[':cluster'] = $cluster;
-                }
-                
-                $updateTotalVarianceStmt = $conn->prepare($updateTotalVarianceQuery);
-                $updateTotalVarianceStmt->execute($totalVarianceParams);
-            }
-        }
-        
-        // SECOND: Update the transaction in the database (excluding ACCEPTANCE and COMMENTS)
-        $updateQuery = "UPDATE budget_preview SET 
-            BudgetHeading = :budgetHeading, 
-            Outcome = :outcome, 
-            Activity = :activity, 
-            BudgetLine = :budgetLine, 
-            Description = :description, 
-            Partner = :partner, 
-            EntryDate = :entryDate, 
-            Amount = :amount, 
-            PVNumber = :pvNumber, 
-            Documents = :documents, 
-            DocumentPaths = :documentPaths, 
-            DocumentTypes = :documentTypes, 
-            QuarterPeriod = :quarterPeriod, 
-            CategoryName = :categoryName, 
-            cluster = :cluster 
-            WHERE PreviewID = :previewId";
-            
-        $stmt = $conn->prepare($updateQuery);
-        $stmt->execute([
-            ':budgetHeading' => $budgetHeading,
-            ':outcome' => $outcome,
-            ':activity' => $activity,
-            ':budgetLine' => $budgetLine,
-            ':description' => $description,
-            ':partner' => $partner,
-            ':entryDate' => $entryDate,
-            ':amount' => $amount,
-            ':pvNumber' => $pvNumber,
-            ':documents' => $documentsJson,
-            ':documentPaths' => $documentPathsStr,
-            ':documentTypes' => $documentTypesStr,
-            ':quarterPeriod' => $quarterPeriod,
-            ':categoryName' => $categoryName,
-            ':cluster' => $cluster,
-            ':previewId' => $previewId
-        ]);
-        
-        // THIRD: Apply the new transaction amount to budget calculations
-        if ($amountInETB > 0) {
-            // Get the budget_id if not already available
-            if (!$budgetId) {
-                // Find the correct budget_id based on category, quarter, and year
-                $entryDateTime = new DateTime($entryDate);
-                $entryYear = (int)$entryDateTime->format('Y');
-                
-                $budgetIdQuery = "SELECT id FROM budget_data 
-                                 WHERE year2 = :year AND category_name = :categoryName AND period_name = :periodName 
-                                 AND :entryDate BETWEEN start_date AND end_date";
-                
-                $budgetIdParams = [
-                    ':year' => $entryYear,
-                    ':categoryName' => $categoryName,
-                    ':periodName' => $quarterPeriod,
-                    ':entryDate' => $entryDate
-                ];
-                
-                if ($cluster) {
-                    $budgetIdQuery .= " AND cluster = :cluster";
-                    $budgetIdParams[':cluster'] = $cluster;
-                }
-                
-                $budgetIdStmt = $conn->prepare($budgetIdQuery);
-                $budgetIdStmt->execute($budgetIdParams);
-                $budgetIdData = $budgetIdStmt->fetch(PDO::FETCH_ASSOC);
-                $budgetId = $budgetIdData['id'] ?? null;
-                
-                // Update the budget_preview with the budget_id
-                if ($budgetId) {
-                    $updateBudgetIdQuery = "UPDATE budget_preview SET budget_id = :budgetId WHERE PreviewID = :previewId";
-                    $updateBudgetIdStmt = $conn->prepare($updateBudgetIdQuery);
-                    $updateBudgetIdStmt->execute([
-                        ':budgetId' => $budgetId,
-                        ':previewId' => $previewId
-                    ]);
-                }
-            }
-            
-            // If we have a budget_id, update the budget_data table
-            if ($budgetId) {
-                // First, get current budget data values
+    if (empty($error_message)) {  // Only proceed if no error
+        try {
+            $conn->beginTransaction();
+           
+            // FIRST: Rollback the original transaction amount from budget calculations
+            if ($budgetId && $originalAmount > 0) {
+                // Get current budget data values
                 $getBudgetQuery = "SELECT budget, actual, forecast, actual_plus_forecast, variance_percentage FROM budget_data WHERE id = :budgetId";
                 $getBudgetStmt = $conn->prepare($getBudgetQuery);
                 $getBudgetStmt->execute([':budgetId' => $budgetId]);
@@ -574,26 +228,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $currentBudget = $budgetData['budget'] ?? 0;
                 $currentActual = $budgetData['actual'] ?? 0;
                 $currentForecast = $budgetData['forecast'] ?? 0;
-                
-                // Calculate new actual value (add the new amount in ETB)
-                $newActual = max(0, $currentActual + $amountInETB);
-                // Subtract only the delta from forecast to preserve user-entered base
-                $newForecast = max(0, ($currentForecast ?? 0) - $amountInETB);
-                
-                // Calculate new actual_plus_forecast using recalculated forecast
-                $newActualPlusForecast = $newActual + $newForecast;
-                
+               
+                // Calculate new actual value (subtract the original amount)
+                $newActual = max(0, $currentActual - $originalAmount);
+                // Add the original amount back to forecast to preserve user-entered base
+                $newForecast = max(0, ($currentForecast ?? 0) + $originalAmount);
+                // Round to 2 decimals
+                $newActual = round($newActual, 2);
+                $newForecast = round($newForecast, 2);
+                // Calculate new actual_plus_forecast using the recalculated forecast
+                $newActualPlusForecast = round($newActual + $newForecast, 2);
+               
                 // Calculate new variance percentage using the requested formula
-                // Variance (%) = (Budget − Actual) / Budget × 100
+                // Variance (%) = (Budget − Actual) / Budget × 100 (use abs for consistency)
                 $newVariancePercentage = 0;
                 if ($currentBudget > 0) {
                     $newVariancePercentage = round((($currentBudget - $newActual) / abs($currentBudget)) * 100, 2);
                 } else if ($currentBudget == 0 && $newActual > 0) {
                     $newVariancePercentage = -100.00;
                 }
-                
+               
                 // Update the specific quarter row in budget_data including recalculated forecast
-                $updateBudgetQuery = "UPDATE budget_data SET 
+                $updateBudgetQuery = "UPDATE budget_data SET
                     actual = :actual,
                     forecast = :forecast,
                     actual_plus_forecast = :actualPlusForecast,
@@ -607,7 +263,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ':variancePercentage' => $newVariancePercentage,
                     ':budgetId' => $budgetId
                 ]);
-                
+               
                 // Extract year and cluster for further updates
                 $extractYearQuery = "SELECT year2, cluster FROM budget_data WHERE id = :budgetId";
                 $extractYearStmt = $conn->prepare($extractYearQuery);
@@ -615,46 +271,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $extractYearData = $extractYearStmt->fetch(PDO::FETCH_ASSOC);
                 $year = $extractYearData['year2'] ?? $originalYear;
                 $cluster = $extractYearData['cluster'] ?? null;
-                
-                if ($year && $categoryName) {
+               
+                if ($year && $originalCategoryName) {
                     // Update Annual Total row - recalculate the sum of quarterly actuals
-                    $updateAnnualQuery = "UPDATE budget_data 
-                        SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b 
-                                    WHERE b.year2 = :year AND b.category_name = :categoryName 
+                    $updateAnnualQuery = "UPDATE budget_data
+                        SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b
+                                    WHERE b.year2 = :year AND b.category_name = :categoryName
                                     AND b.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
-                    
+                   
                     $annualParams = [
                         ':year' => $year,
-                        ':categoryName' => $categoryName
+                        ':categoryName' => $originalCategoryName
                     ];
-                    
+                   
                     if ($cluster) {
                         $updateAnnualQuery .= " AND b.cluster = :cluster";
                         $annualParams[':cluster'] = $cluster;
                     }
                     $updateAnnualQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
-                    
+                   
                     $annualParams[':year2'] = $year;
-                    $annualParams[':categoryName2'] = $categoryName;
-                    
+                    $annualParams[':categoryName2'] = $originalCategoryName;
+                   
                     if ($cluster) {
                         $annualParams[':cluster2'] = $cluster;
                         $updateAnnualQuery .= " AND cluster = :cluster2";
                     }
-                    
+                   
                     $updateAnnualStmt = $conn->prepare($updateAnnualQuery);
                     $updateAnnualStmt->execute($annualParams);
-                    
+                   
                     // Sync Annual Total forecast as the sum of quarterly forecasts
-                    $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                    $updateAnnualForecastSumQuery = "UPDATE budget_data
                         SET forecast = (
-                            SELECT SUM(COALESCE(forecast, 0)) 
-                            FROM budget_data b 
-                            WHERE b.year2 = :year AND b.category_name = :categoryName 
+                            SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b
+                            WHERE b.year2 = :year AND b.category_name = :categoryName
                             AND b.period_name IN ('Q1','Q2','Q3','Q4')";
                     $annualForecastParams = [
                         ':year' => $year,
-                        ':categoryName' => $categoryName
+                        ':categoryName' => $originalCategoryName
                     ];
                     if ($cluster) {
                         $updateAnnualForecastSumQuery .= " AND b.cluster = :cluster";
@@ -662,85 +317,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $updateAnnualForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
                     $annualForecastParams[':year2'] = $year;
-                    $annualForecastParams[':categoryName2'] = $categoryName;
+                    $annualForecastParams[':categoryName2'] = $originalCategoryName;
                     if ($cluster) {
                         $updateAnnualForecastSumQuery .= " AND cluster = :cluster2";
                         $annualForecastParams[':cluster2'] = $cluster;
                     }
                     $updateAnnualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
                     $updateAnnualForecastSumStmt->execute($annualForecastParams);
-
                     // Update actual_plus_forecast for Annual Total
-                    $updateAnnualActualForecastQuery = "UPDATE budget_data 
+                    $updateAnnualActualForecastQuery = "UPDATE budget_data
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                         WHERE year2 = :year AND category_name = :categoryName AND period_name = 'Annual Total'";
-                    
+                   
                     $actualForecastParams = [
                         ':year' => $year,
-                        ':categoryName' => $categoryName
+                        ':categoryName' => $originalCategoryName
                     ];
-                    
+                   
                     if ($cluster) {
                         $updateAnnualActualForecastQuery .= " AND cluster = :cluster";
                         $actualForecastParams[':cluster'] = $cluster;
                     }
-                    
+                   
                     $updateAnnualActualForecastStmt = $conn->prepare($updateAnnualActualForecastQuery);
                     $updateAnnualActualForecastStmt->execute($actualForecastParams);
-                    
-                    // Update variance percentages
-                    // Variance (%) = (Budget − Actual) / Budget × 100
-                    $updateVarianceQuery = "UPDATE budget_data 
-                        SET variance_percentage = CASE 
-                            WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / budget) * 100), 2)
+                   
+                    // Update variance percentages (consistent with abs)
+                    $updateVarianceQuery = "UPDATE budget_data
+                        SET variance_percentage = CASE
+                            WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
                             WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
-                            ELSE 0.00 
+                            ELSE 0.00
                         END
                         WHERE year2 = :year AND category_name = :categoryName";
-                    
+                   
                     $varianceParams = [
                         ':year' => $year,
-                        ':categoryName' => $categoryName
+                        ':categoryName' => $originalCategoryName
                     ];
-                    
+                   
                     if ($cluster) {
                         $updateVarianceQuery .= " AND cluster = :cluster";
                         $varianceParams[':cluster'] = $cluster;
                     }
-                    
+                   
                     $updateVarianceStmt = $conn->prepare($updateVarianceQuery);
                     $updateVarianceStmt->execute($varianceParams);
-                    
+                   
                     // Finally, update the Total row
                     // Calculate new actual for Total row
-                    $updateTotalQuery = "UPDATE budget_data 
-                        SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b 
+                    $updateTotalQuery = "UPDATE budget_data
+                        SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b
                                     WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
-                    
+                   
                     $totalParams = [
                         ':year' => $year
                     ];
-                    
+                   
                     if ($cluster) {
                         $updateTotalQuery .= " AND b.cluster = :cluster";
                         $totalParams[':cluster'] = $cluster;
                     }
                     $updateTotalQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
-                    
+                   
                     $totalParams[':year2'] = $year;
-                    
+                   
                     if ($cluster) {
                         $totalParams[':cluster2'] = $cluster;
                         $updateTotalQuery .= " AND cluster = :cluster2";
                     }
-                    
+                   
                     $updateTotalStmt = $conn->prepare($updateTotalQuery);
                     $updateTotalStmt->execute($totalParams);
-                    
+                   
                     // Sync Total forecast as sum of Annual Total forecasts across categories
-                    $updateTotalForecastSumQuery = "UPDATE budget_data 
+                    $updateTotalForecastSumQuery = "UPDATE budget_data
                         SET forecast = (
-                            SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b 
+                            SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b
                             WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
                     $totalForecastParams = [
                         ':year' => $year
@@ -757,127 +410,438 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
                     $updateTotalForecastSumStmt->execute($totalForecastParams);
-
                     // Update actual_plus_forecast for Total row
-                    $updateTotalActualForecastQuery = "UPDATE budget_data 
+                    $updateTotalActualForecastQuery = "UPDATE budget_data
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
                         WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
-                    
+                   
                     $totalActualForecastParams = [
                         ':year' => $year
                     ];
-                    
+                   
                     if ($cluster) {
                         $updateTotalActualForecastQuery .= " AND cluster = :cluster";
                         $totalActualForecastParams[':cluster'] = $cluster;
                     }
-                    
+                   
                     $updateTotalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
                     $updateTotalActualForecastStmt->execute($totalActualForecastParams);
-                    
-                    // Update variance for Total row
-                    // Variance (%) = (Budget − Actual) / Budget × 100
-                    $updateTotalVarianceQuery = "UPDATE budget_data 
-                        SET variance_percentage = CASE 
-                            WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / budget) * 100), 2)
+                   
+                    // Update variance for Total row (consistent with abs)
+                    $updateTotalVarianceQuery = "UPDATE budget_data
+                        SET variance_percentage = CASE
+                            WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
                             WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
-                            ELSE 0.00 
+                            ELSE 0.00
                         END
                         WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
-                    
+                   
                     $totalVarianceParams = [
                         ':year' => $year
                     ];
-                    
+                   
                     if ($cluster) {
                         $updateTotalVarianceQuery .= " AND cluster = :cluster";
                         $totalVarianceParams[':cluster'] = $cluster;
                     }
-                    
+                   
                     $updateTotalVarianceStmt = $conn->prepare($updateTotalVarianceQuery);
                     $updateTotalVarianceStmt->execute($totalVarianceParams);
                 }
             }
-        }
-        
-        // Update the budget_preview table with calculated values
-        // Get the budget_id if we don't have it yet
-        if (!$budgetId) {
-            // Find the correct budget_id based on category, quarter, and year
-            $entryDateTime = new DateTime($entryDate);
-            $entryYear = (int)$entryDateTime->format('Y');
-            
-            $budgetIdQuery = "SELECT id FROM budget_data 
-                             WHERE year2 = :year AND category_name = :categoryName AND period_name = :periodName 
-                             AND :entryDate BETWEEN start_date AND end_date";
-            
-            $budgetIdParams = [
-                ':year' => $entryYear,
+           
+            // SECOND: Update the transaction in the database (excluding ACCEPTANCE and COMMENTS)
+            $updateQuery = "UPDATE budget_preview SET
+                BudgetHeading = :budgetHeading,
+                Outcome = :outcome,
+                Activity = :activity,
+                BudgetLine = :budgetLine,
+                Description = :description,
+                Partner = :partner,
+                EntryDate = :entryDate,
+                Amount = :amount,
+                PVNumber = :pvNumber,
+                Documents = :documents,
+                DocumentPaths = :documentPaths,
+                DocumentTypes = :documentTypes,
+                QuarterPeriod = :quarterPeriod,
+                CategoryName = :categoryName,
+                cluster = :cluster
+                WHERE PreviewID = :previewId";
+               
+            $stmt = $conn->prepare($updateQuery);
+            $stmt->execute([
+                ':budgetHeading' => $budgetHeading,
+                ':outcome' => $outcome,
+                ':activity' => $activity,
+                ':budgetLine' => $budgetLine,
+                ':description' => $description,
+                ':partner' => $partner,
+                ':entryDate' => $entryDate,
+                ':amount' => $amount,
+                ':pvNumber' => $pvNumber,
+                ':documents' => $documentsJson,
+                ':documentPaths' => $documentPathsStr,
+                ':documentTypes' => $documentTypesStr,
+                ':quarterPeriod' => $quarterPeriod,
                 ':categoryName' => $categoryName,
-                ':periodName' => $quarterPeriod,
-                ':entryDate' => $entryDate
-            ];
-            
-            if ($cluster) {
-                $budgetIdQuery .= " AND cluster = :cluster";
-                $budgetIdParams[':cluster'] = $cluster;
+                ':cluster' => $cluster,
+                ':previewId' => $previewId
+            ]);
+           
+            // THIRD: Apply the new transaction amount to budget calculations
+            if ($amount > 0) {
+                // Get the budget_id if not already available
+                if (!$budgetId) {
+                    // Find the correct budget_id based on category, quarter, and year
+                    $entryDateTime = new DateTime($entryDate);
+                    $entryYear = (int)$entryDateTime->format('Y');
+                   
+                    $budgetIdQuery = "SELECT id FROM budget_data
+                                     WHERE year2 = :year AND category_name = :categoryName AND period_name = :periodName
+                                     AND :entryDate BETWEEN start_date AND end_date";
+                   
+                    $budgetIdParams = [
+                        ':year' => $entryYear,
+                        ':categoryName' => $categoryName,
+                        ':periodName' => $quarterPeriod,
+                        ':entryDate' => $entryDate
+                    ];
+                   
+                    if ($cluster) {
+                        $budgetIdQuery .= " AND cluster = :cluster";
+                        $budgetIdParams[':cluster'] = $cluster;
+                    }
+                   
+                    $budgetIdStmt = $conn->prepare($budgetIdQuery);
+                    $budgetIdStmt->execute($budgetIdParams);
+                    $budgetIdData = $budgetIdStmt->fetch(PDO::FETCH_ASSOC);
+                    $budgetId = $budgetIdData['id'] ?? null;
+                   
+                    // Update the budget_preview with the budget_id
+                    if ($budgetId) {
+                        $updateBudgetIdQuery = "UPDATE budget_preview SET budget_id = :budgetId WHERE PreviewID = :previewId";
+                        $updateBudgetIdStmt = $conn->prepare($updateBudgetIdQuery);
+                        $updateBudgetIdStmt->execute([
+                            ':budgetId' => $budgetId,
+                            ':previewId' => $previewId
+                        ]);
+                    }
+                }
+               
+                // If we have a budget_id, update the budget_data table
+                if ($budgetId) {
+                    // First, get current budget data values
+                    $getBudgetQuery = "SELECT budget, actual, forecast, actual_plus_forecast, variance_percentage FROM budget_data WHERE id = :budgetId";
+                    $getBudgetStmt = $conn->prepare($getBudgetQuery);
+                    $getBudgetStmt->execute([':budgetId' => $budgetId]);
+                    $budgetData = $getBudgetStmt->fetch(PDO::FETCH_ASSOC);
+                    $currentBudget = $budgetData['budget'] ?? 0;
+                    $currentActual = $budgetData['actual'] ?? 0;
+                    $currentForecast = $budgetData['forecast'] ?? 0;
+                   
+                    // Calculate new actual value (add the new amount)
+                    $newActual = max(0, $currentActual + $amount);
+                    // Subtract only the delta from forecast to preserve user-entered base
+                    $newForecast = max(0, ($currentForecast ?? 0) - $amount);
+                    // Round to 2 decimals
+                    $newActual = round($newActual, 2);
+                    $newForecast = round($newForecast, 2);
+                   
+                    // Calculate new actual_plus_forecast using recalculated forecast
+                    $newActualPlusForecast = round($newActual + $newForecast, 2);
+                   
+                    // Calculate new variance percentage using the requested formula
+                    // Variance (%) = (Budget − Actual) / Budget × 100 (use abs for consistency)
+                    $newVariancePercentage = 0;
+                    if ($currentBudget > 0) {
+                        $newVariancePercentage = round((($currentBudget - $newActual) / abs($currentBudget)) * 100, 2);
+                    } else if ($currentBudget == 0 && $newActual > 0) {
+                        $newVariancePercentage = -100.00;
+                    }
+                   
+                    // Update the specific quarter row in budget_data including recalculated forecast
+                    $updateBudgetQuery = "UPDATE budget_data SET
+                        actual = :actual,
+                        forecast = :forecast,
+                        actual_plus_forecast = :actualPlusForecast,
+                        variance_percentage = :variancePercentage
+                        WHERE id = :budgetId";
+                    $updateStmt = $conn->prepare($updateBudgetQuery);
+                    $updateStmt->execute([
+                        ':actual' => $newActual,
+                        ':forecast' => $newForecast,
+                        ':actualPlusForecast' => $newActualPlusForecast,
+                        ':variancePercentage' => $newVariancePercentage,
+                        ':budgetId' => $budgetId
+                    ]);
+                   
+                    // Extract year and cluster for further updates
+                    $extractYearQuery = "SELECT year2, cluster FROM budget_data WHERE id = :budgetId";
+                    $extractYearStmt = $conn->prepare($extractYearQuery);
+                    $extractYearStmt->execute([':budgetId' => $budgetId]);
+                    $extractYearData = $extractYearStmt->fetch(PDO::FETCH_ASSOC);
+                    $year = $extractYearData['year2'] ?? $originalYear;
+                    $cluster = $extractYearData['cluster'] ?? null;
+                   
+                    if ($year && $categoryName) {
+                        // Update Annual Total row - recalculate the sum of quarterly actuals
+                        $updateAnnualQuery = "UPDATE budget_data
+                            SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b
+                                        WHERE b.year2 = :year AND b.category_name = :categoryName
+                                        AND b.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+                       
+                        $annualParams = [
+                            ':year' => $year,
+                            ':categoryName' => $categoryName
+                        ];
+                       
+                        if ($cluster) {
+                            $updateAnnualQuery .= " AND b.cluster = :cluster";
+                            $annualParams[':cluster'] = $cluster;
+                        }
+                        $updateAnnualQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
+                       
+                        $annualParams[':year2'] = $year;
+                        $annualParams[':categoryName2'] = $categoryName;
+                       
+                        if ($cluster) {
+                            $annualParams[':cluster2'] = $cluster;
+                            $updateAnnualQuery .= " AND cluster = :cluster2";
+                        }
+                       
+                        $updateAnnualStmt = $conn->prepare($updateAnnualQuery);
+                        $updateAnnualStmt->execute($annualParams);
+                       
+                        // Sync Annual Total forecast as the sum of quarterly forecasts
+                        $updateAnnualForecastSumQuery = "UPDATE budget_data
+                            SET forecast = (
+                                SELECT SUM(COALESCE(forecast, 0))
+                                FROM budget_data b
+                                WHERE b.year2 = :year AND b.category_name = :categoryName
+                                AND b.period_name IN ('Q1','Q2','Q3','Q4')";
+                        $annualForecastParams = [
+                            ':year' => $year,
+                            ':categoryName' => $categoryName
+                        ];
+                        if ($cluster) {
+                            $updateAnnualForecastSumQuery .= " AND b.cluster = :cluster";
+                            $annualForecastParams[':cluster'] = $cluster;
+                        }
+                        $updateAnnualForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = :categoryName2 AND period_name = 'Annual Total'";
+                        $annualForecastParams[':year2'] = $year;
+                        $annualForecastParams[':categoryName2'] = $categoryName;
+                        if ($cluster) {
+                            $updateAnnualForecastSumQuery .= " AND cluster = :cluster2";
+                            $annualForecastParams[':cluster2'] = $cluster;
+                        }
+                        $updateAnnualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                        $updateAnnualForecastSumStmt->execute($annualForecastParams);
+                        // Update actual_plus_forecast for Annual Total
+                        $updateAnnualActualForecastQuery = "UPDATE budget_data
+                            SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
+                            WHERE year2 = :year AND category_name = :categoryName AND period_name = 'Annual Total'";
+                       
+                        $actualForecastParams = [
+                            ':year' => $year,
+                            ':categoryName' => $categoryName
+                        ];
+                       
+                        if ($cluster) {
+                            $updateAnnualActualForecastQuery .= " AND cluster = :cluster";
+                            $actualForecastParams[':cluster'] = $cluster;
+                        }
+                       
+                        $updateAnnualActualForecastStmt = $conn->prepare($updateAnnualActualForecastQuery);
+                        $updateAnnualActualForecastStmt->execute($actualForecastParams);
+                       
+                        // Update variance percentages (consistent with abs)
+                        $updateVarianceQuery = "UPDATE budget_data
+                            SET variance_percentage = CASE
+                                WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
+                                WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
+                                ELSE 0.00
+                            END
+                            WHERE year2 = :year AND category_name = :categoryName";
+                       
+                        $varianceParams = [
+                            ':year' => $year,
+                            ':categoryName' => $categoryName
+                        ];
+                       
+                        if ($cluster) {
+                            $updateVarianceQuery .= " AND cluster = :cluster";
+                            $varianceParams[':cluster'] = $cluster;
+                        }
+                       
+                        $updateVarianceStmt = $conn->prepare($updateVarianceQuery);
+                        $updateVarianceStmt->execute($varianceParams);
+                       
+                        // Finally, update the Total row
+                        // Calculate new actual for Total row
+                        $updateTotalQuery = "UPDATE budget_data
+                            SET actual = (SELECT SUM(COALESCE(actual, 0)) FROM budget_data b
+                                        WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
+                       
+                        $totalParams = [
+                            ':year' => $year
+                        ];
+                       
+                        if ($cluster) {
+                            $updateTotalQuery .= " AND b.cluster = :cluster";
+                            $totalParams[':cluster'] = $cluster;
+                        }
+                        $updateTotalQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
+                       
+                        $totalParams[':year2'] = $year;
+                       
+                        if ($cluster) {
+                            $totalParams[':cluster2'] = $cluster;
+                            $updateTotalQuery .= " AND cluster = :cluster2";
+                        }
+                       
+                        $updateTotalStmt = $conn->prepare($updateTotalQuery);
+                        $updateTotalStmt->execute($totalParams);
+                       
+                        // Sync Total forecast as sum of Annual Total forecasts across categories
+                        $updateTotalForecastSumQuery = "UPDATE budget_data
+                            SET forecast = (
+                                SELECT SUM(COALESCE(forecast, 0)) FROM budget_data b
+                                WHERE b.year2 = :year AND b.period_name = 'Annual Total' AND b.category_name != 'Total'";
+                        $totalForecastParams = [
+                            ':year' => $year
+                        ];
+                        if ($cluster) {
+                            $updateTotalForecastSumQuery .= " AND b.cluster = :cluster";
+                            $totalForecastParams[':cluster'] = $cluster;
+                        }
+                        $updateTotalForecastSumQuery .= ") WHERE year2 = :year2 AND category_name = 'Total' AND period_name = 'Total'";
+                        $totalForecastParams[':year2'] = $year;
+                        if ($cluster) {
+                            $updateTotalForecastSumQuery .= " AND cluster = :cluster2";
+                            $totalForecastParams[':cluster2'] = $cluster;
+                        }
+                        $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                        $updateTotalForecastSumStmt->execute($totalForecastParams);
+                        // Update actual_plus_forecast for Total row
+                        $updateTotalActualForecastQuery = "UPDATE budget_data
+                            SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
+                            WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
+                       
+                        $totalActualForecastParams = [
+                            ':year' => $year
+                        ];
+                       
+                        if ($cluster) {
+                            $updateTotalActualForecastQuery .= " AND cluster = :cluster";
+                            $totalActualForecastParams[':cluster'] = $cluster;
+                        }
+                       
+                        $updateTotalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
+                        $updateTotalActualForecastStmt->execute($totalActualForecastParams);
+                       
+                        // Update variance for Total row (consistent with abs)
+                        $updateTotalVarianceQuery = "UPDATE budget_data
+                            SET variance_percentage = CASE
+                                WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
+                                WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
+                                ELSE 0.00
+                            END
+                            WHERE year2 = :year AND category_name = 'Total' AND period_name = 'Total'";
+                       
+                        $totalVarianceParams = [
+                            ':year' => $year
+                        ];
+                       
+                        if ($cluster) {
+                            $updateTotalVarianceQuery .= " AND cluster = :cluster";
+                            $totalVarianceParams[':cluster'] = $cluster;
+                        }
+                       
+                        $updateTotalVarianceStmt = $conn->prepare($updateTotalVarianceQuery);
+                        $updateTotalVarianceStmt->execute($totalVarianceParams);
+                    }
+                }
             }
-            
-            $budgetIdStmt = $conn->prepare($budgetIdQuery);
-            $budgetIdStmt->execute($budgetIdParams);
-            $budgetIdData = $budgetIdStmt->fetch(PDO::FETCH_ASSOC);
-            $budgetId = $budgetIdData['id'] ?? null;
+           
+            // Update the budget_preview table with calculated values
+            // Get the budget_id if we don't have it yet
+            if (!$budgetId) {
+                // Find the correct budget_id based on category, quarter, and year
+                $entryDateTime = new DateTime($entryDate);
+                $entryYear = (int)$entryDateTime->format('Y');
+               
+                $budgetIdQuery = "SELECT id FROM budget_data
+                                 WHERE year2 = :year AND category_name = :categoryName AND period_name = :periodName
+                                 AND :entryDate BETWEEN start_date AND end_date";
+               
+                $budgetIdParams = [
+                    ':year' => $entryYear,
+                    ':categoryName' => $categoryName,
+                    ':periodName' => $quarterPeriod,
+                    ':entryDate' => $entryDate
+                ];
+               
+                if ($cluster) {
+                    $budgetIdQuery .= " AND cluster = :cluster";
+                    $budgetIdParams[':cluster'] = $cluster;
+                }
+               
+                $budgetIdStmt = $conn->prepare($budgetIdQuery);
+                $budgetIdStmt->execute($budgetIdParams);
+                $budgetIdData = $budgetIdStmt->fetch(PDO::FETCH_ASSOC);
+                $budgetId = $budgetIdData['id'] ?? null;
+            }
+           
+            // Read values for budget_preview directly from budget_data
+            $originalBudgetValue = 0;
+            $newActualSpent = 0;
+            $newForecastAmount = 0;
+            $newRemainingBudget = 0;
+            $newVariancePercentage = 0;
+            if ($budgetId) {
+                $budgetQuery = "SELECT budget, actual, forecast, variance_percentage FROM budget_data WHERE id = :budgetId";
+                $budgetStmt = $conn->prepare($budgetQuery);
+                $budgetStmt->execute([':budgetId' => $budgetId]);
+                $budgetRow = $budgetStmt->fetch(PDO::FETCH_ASSOC);
+                $originalBudgetValue = $budgetRow['budget'] ?? 0;
+                $newActualSpent = $budgetRow['actual'] ?? 0;
+                $newForecastAmount = $budgetRow['forecast'] ?? 0;
+                $newRemainingBudget = $budgetRow['forecast'] ?? 0;
+                $newVariancePercentage = $budgetRow['variance_percentage'] ?? 0;
+            }
+           
+            // Update the budget_preview table with calculated values
+            $updatePreviewQuery = "UPDATE budget_preview SET
+                OriginalBudget = :originalBudget,
+                RemainingBudget = :remainingBudget,
+                ActualSpent = :actualSpent,
+                ForecastAmount = :forecastAmount,
+                VariancePercentage = :variancePercentage
+                WHERE PreviewID = :previewId";
+            $updatePreviewStmt = $conn->prepare($updatePreviewQuery);
+            $updatePreviewStmt->execute([
+                ':originalBudget' => $originalBudgetValue,
+                ':remainingBudget' => $newRemainingBudget,
+                ':actualSpent' => $newActualSpent,
+                ':forecastAmount' => $newForecastAmount,
+                ':variancePercentage' => $newVariancePercentage,
+                ':previewId' => $previewId
+            ]);
+           
+            // Commit the transaction if everything was successful
+            $conn->commit();
+           
+            $_SESSION['success_message'] = "Transaction updated successfully.";
+            header("Location: history.php");
+            exit();
+        } catch (Exception $e) {
+            // Rollback the transaction if there was an error
+            $conn->rollback();
+            $error_message = "Error updating transaction: " . $e->getMessage();
         }
-        
-        // Read values for budget_preview directly from budget_data
-        $originalBudgetValue = 0;
-        $newActualSpent = 0;
-        $newForecastAmount = 0;
-        $newRemainingBudget = 0;
-        $newVariancePercentage = 0;
-        if ($budgetId) {
-            $budgetQuery = "SELECT budget, actual, forecast, variance_percentage FROM budget_data WHERE id = :budgetId";
-            $budgetStmt = $conn->prepare($budgetQuery);
-            $budgetStmt->execute([':budgetId' => $budgetId]);
-            $budgetRow = $budgetStmt->fetch(PDO::FETCH_ASSOC);
-            $originalBudgetValue = $budgetRow['budget'] ?? 0;
-            $newActualSpent = $budgetRow['actual'] ?? 0;
-            $newForecastAmount = $budgetRow['forecast'] ?? 0;
-            $newRemainingBudget = $budgetRow['forecast'] ?? 0;
-            $newVariancePercentage = $budgetRow['variance_percentage'] ?? 0;
-        }
-        
-        // Update the budget_preview table with calculated values
-        $updatePreviewQuery = "UPDATE budget_preview SET 
-            OriginalBudget = :originalBudget,
-            RemainingBudget = :remainingBudget,
-            ActualSpent = :actualSpent,
-            ForecastAmount = :forecastAmount,
-            VariancePercentage = :variancePercentage
-            WHERE PreviewID = :previewId";
-        $updatePreviewStmt = $conn->prepare($updatePreviewQuery);
-        $updatePreviewStmt->execute([
-            ':originalBudget' => $originalBudgetValue,
-            ':remainingBudget' => $newRemainingBudget,
-            ':actualSpent' => $newActualSpent,
-            ':forecastAmount' => $newForecastAmount,
-            ':variancePercentage' => $newVariancePercentage,
-            ':previewId' => $previewId
-        ]);
-        
-        // Commit the transaction if everything was successful
-        $conn->commit();
-        
-        $_SESSION['success_message'] = "Transaction updated successfully.";
-        header("Location: history.php");
-        exit();
-    } catch (Exception $e) {
-        // Rollback the transaction if there was an error
-        $conn->rollback();
-        $error_message = "Error updating transaction: " . $e->getMessage();
     }
 }
-
 // Parse document data for display
 $documentList = [];
 if (!empty($transaction['Documents'])) {
@@ -889,7 +853,7 @@ if (!empty($transaction['Documents'])) {
     // Fallback to comma-separated format
     $paths = explode(',', $transaction['DocumentPaths']);
     $types = !empty($transaction['DocumentTypes']) ? explode(',', $transaction['DocumentTypes']) : [];
-    
+   
     for ($i = 0; $i < count($paths); $i++) {
         if (!empty($paths[$i])) {
             $documentList[] = [
@@ -900,7 +864,6 @@ if (!empty($transaction['Documents'])) {
         }
     }
 }
-
 // Fetch checklist items from database using PDO
 $completeChecklist = [];
 $categoryOptions = [];
@@ -911,7 +874,7 @@ try {
         $stmt = $conn->prepare($query);
         $stmt->execute();
         $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
+       
         if ($results) {
             $categories = [];
             foreach ($results as $row) {
@@ -919,29 +882,29 @@ try {
                 $categoryParts = explode(' ', $row['category'], 2);
                 $categoryNumber = $categoryParts[0];
                 $categoryName = $categoryParts[1] ?? $categoryParts[0];
-                
+               
                 // Create the key that matches the select options (using dot notation like in documents.php)
                 $categoryKey = $categoryNumber . '. ' . $categoryName;
-                
+               
                 // Store categories for select options
                 if (!in_array($categoryKey, $categories)) {
                     $categories[] = $categoryKey;
                 }
-                
+               
                 // Build the completeChecklist array properly
                 if (!isset($completeChecklist[$categoryKey])) {
                     $completeChecklist[$categoryKey] = [];
                 }
                 $completeChecklist[$categoryKey][] = $row['document_name'];
             }
-            
+           
             // Sort categories by number
             usort($categories, function($a, $b) {
                 $numA = (int)explode('. ', $a)[0];
                 $numB = (int)explode('. ', $b)[0];
                 return $numA - $numB;
             });
-            
+           
             $categoryOptions = $categories;
         }
     }
@@ -949,7 +912,6 @@ try {
     // Log error but continue with fallback
     error_log("Database error in edit_transaction.php: " . $e->getMessage());
 }
-
 // If database fetch failed or returned no results, fallback to hardcoded checklist
 if (empty($completeChecklist)) {
     $completeChecklist = [
@@ -1088,10 +1050,9 @@ if (empty($completeChecklist)) {
             "Payment voucher"
         ]
     ];
-    
+   
     $categoryOptions = array_keys($completeChecklist);
 }
-
 // Flatten the checklist for dropdown options
 $flattenedChecklist = [];
 foreach ($completeChecklist as $category => $documents) {
@@ -1100,14 +1061,11 @@ foreach ($completeChecklist as $category => $documents) {
         $flattenedChecklist[$document] = "-- " . $document; // Add documents with indentation
     }
 }
-
 // Create JSON for JavaScript
 $flattenedChecklistJson = json_encode($flattenedChecklist);
-
 // Include header after processing to avoid header errors
-include 'header.php'; 
+include 'header.php';
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1119,7 +1077,7 @@ include 'header.php';
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        
+       
         body {
             font-family: 'Poppins', 'Inter', sans-serif;
             background-color: #f0f4f8;
@@ -1129,13 +1087,11 @@ include 'header.php';
     justify-content: center;
     padding: 2rem 0; /* Zero horizontal padding on mobile */
 }
-
 @media (min-width: 768px) {
     .main-content-flex {
         padding: 2rem 1rem; /* Padding for tablets */
     }
 }
-
 @media (min-width: 1024px) {
     .main-content-flex {
         padding: 2rem; /* Original padding for desktop */
@@ -1145,7 +1101,6 @@ include 'header.php';
     width: 100%;
     max-width: 1400px;
 }
-
 /* Full edge-to-edge on mobile */
 @media (max-width: 767px) {
     .content-container {
@@ -1250,12 +1205,23 @@ include 'header.php';
             color: #6b7280;
             margin-top: 0.25rem;
         }
+       
+        /* Amount validation error styling */
+        .amount-error {
+            border-color: #ef4444 !important;
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2) !important;
+        }
+       
+        .amount-error-message {
+            color: #ef4444;
+            font-size: 0.875rem;
+            margin-top: 0.25rem;
+        }
         /* Make the header padding responsive */
 header {
     padding-left: 1rem; /* Reduced from 2rem (px-8) */
     padding-right: 1rem; /* Reduced from 2rem (px-8) */
 }
-
 /* For very small screens, you can remove padding entirely */
 @media (max-width: 375px) {
     header {
@@ -1263,14 +1229,12 @@ header {
         padding-right: 0.5rem;
     }
 }
-
 /* Make the button text wrap on small screens */
 a[href="history.php"] {
     white-space: normal; /* Allows text to wrap */
     padding-left: 0.75rem; /* Adjust padding for better look when wrapped */
     padding-right: 0.75rem;
 }
-
 /* Optional: Hide text and show only icon on very small screens */
 @media (max-width: 420px) {
     a[href="history.php"] span {
@@ -1285,10 +1249,10 @@ a[href="history.php"] {
     </style>
 </head>
 <body>
-<?php 
+<?php
 // Check if this file is being included or accessed directly
 $included = defined('INCLUDED_FROM_INDEX') || isset($GLOBALS['in_index_context']);
-if (!$included): 
+if (!$included):
 ?>
 <!-- Main content area -->
 <div class="flex flex-col flex-1 min-w-0">
@@ -1309,14 +1273,12 @@ if (!$included):
         </div>
         <div class="flex items-center space-x-4">
             <!-- Notification bell -->
-         
+        
         </div>
     </header>
-
     <!-- Content Area -->
     <main class="flex-1 p-8 overflow-y-auto overflow-x-auto bg-gray-50">
 <?php endif; ?>
-
     <div class="main-content-flex">
         <div class="content-container">
            <div id="editTransactionSection" class="bg-white p-4 sm:p-6 md:p-10 rounded-3xl shadow-2xl w-full mx-auto card-hover animate-fadeIn">
@@ -1326,65 +1288,68 @@ if (!$included):
                         <i class="fas fa-arrow-left"></i> <span>Back to History</span>
                     </a>
                 </div>
-                
+               
                 <?php if (!empty($error_message)): ?>
                     <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-6" role="alert">
                         <strong class="font-bold">Error: </strong>
                         <span class="block sm:inline"><?php echo htmlspecialchars($error_message); ?></span>
                     </div>
                 <?php endif; ?>
-                
+               
                 <form method="POST" action="" enctype="multipart/form-data">
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div class="form-group">
                             <label class="form-label" for="budget_heading">Budget Heading</label>
                             <input type="text" id="budget_heading" name="budget_heading" class="form-input" value="<?php echo htmlspecialchars($transaction['BudgetHeading'] ?? ''); ?>" required>
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="outcome">Outcome</label>
                             <input type="text" id="outcome" name="outcome" class="form-input" value="<?php echo htmlspecialchars($transaction['Outcome'] ?? ''); ?>">
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="activity">Activity</label>
                             <input type="text" id="activity" name="activity" class="form-input" value="<?php echo htmlspecialchars($transaction['Activity'] ?? ''); ?>">
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="budget_line">Budget Line</label>
                             <input type="text" id="budget_line" name="budget_line" class="form-input" value="<?php echo htmlspecialchars($transaction['BudgetLine'] ?? ''); ?>">
                         </div>
-                        
+                       
                         <div class="form-group md:col-span-2">
                             <label class="form-label" for="description">Description</label>
                             <textarea id="description" name="description" class="form-textarea" rows="3"><?php echo htmlspecialchars($transaction['Description'] ?? ''); ?></textarea>
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="partner">Partner</label>
                             <input type="text" id="partner" name="partner" class="form-input" value="<?php echo htmlspecialchars($transaction['Partner'] ?? ''); ?>">
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="entry_date">Entry Date</label>
                             <input type="date" id="entry_date" name="entry_date" class="form-input" value="<?php echo htmlspecialchars($transaction['EntryDate'] ?? ''); ?>" required>
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="amount">Amount (Enter in ETB)</label>
-                            <input type="number" step="0.01" id="amount" name="amount" class="form-input" value="<?php echo htmlspecialchars($amountInETB ?? 0); ?>" required>
+                            <input type="number" step="0.01" min="0" max="999999999.99" id="amount" name="amount" class="form-input" value="<?php echo htmlspecialchars($displayETB ?? '0.00'); ?>" required placeholder="e.g., 20025.15">
                             <div class="text-sm text-gray-500 mt-1">
-                                Original amount: <?php echo htmlspecialchars($transaction['Amount'] ?? 0); ?> USD
+                                Original amount: <?php echo htmlspecialchars(number_format($transaction['Amount'] ?? 0, 9)); ?> <?php echo htmlspecialchars($originalCurrency ?? 'USD'); ?>
                             </div>
+                            <?php if (!empty($error_message)): ?>
+                                <div class="amount-error-message"><?php echo htmlspecialchars($error_message); ?></div>
+                            <?php endif; ?>
                             <!-- Hidden budget_id field for transaction updates -->
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="pv_number">PV Number</label>
                             <input type="text" id="pv_number" name="pv_number" class="form-input" value="<?php echo htmlspecialchars($transaction['PVNumber'] ?? ''); ?>">
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="quarter_period">Quarter Period</label>
                             <select id="quarter_period" name="quarter_period" class="form-select" required>
@@ -1394,26 +1359,26 @@ if (!$included):
                                 <option value="Q4" <?php echo ($transaction['QuarterPeriod'] ?? '') === 'Q4' ? 'selected' : ''; ?>>Q4</option>
                             </select>
                         </div>
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="category_name">Category Name</label>
                             <input type="text" id="category_name" name="category_name" class="form-input" value="<?php echo htmlspecialchars($transaction['CategoryName'] ?? ''); ?>" required>
                         </div>
-                        
+                       
                         <!-- Hidden fields for calculated values -->
                         <input type="hidden" id="original_budget" name="original_budget" value="<?php echo htmlspecialchars($transaction['OriginalBudget'] ?? 0); ?>">
                         <input type="hidden" id="remaining_budget" name="remaining_budget" value="<?php echo htmlspecialchars($transaction['RemainingBudget'] ?? 0); ?>">
                         <input type="hidden" id="actual_spent" name="actual_spent" value="<?php echo htmlspecialchars($transaction['ActualSpent'] ?? 0); ?>">
                         <input type="hidden" id="forecast_amount" name="forecast_amount" value="<?php echo htmlspecialchars($transaction['ForecastAmount'] ?? 0); ?>">
-                        
+                       
                         <div class="form-group">
                             <label class="form-label" for="cluster">Cluster</label>
                             <input type="text" id="cluster" name="cluster" class="form-input" value="<?php echo htmlspecialchars($transaction['cluster'] ?? ''); ?>" required>
                         </div>
-                        
+                       
                         <!-- Hidden field to store budget_id -->
                         <input type="hidden" id="budget_id" name="budget_id" value="<?php echo htmlspecialchars($transaction['budget_id'] ?? ''); ?>">
-                        
+                       
                         <!-- Document Section -->
                         <div class="md:col-span-2">
                             <h4 class="text-xl font-bold text-gray-800 mb-4">Documents</h4>
@@ -1487,7 +1452,7 @@ if (!$included):
                             </button>
                         </div>
                     </div>
-                    
+                   
                     <div class="flex justify-end space-x-4 mt-8">
                         <a href="history.php" class="px-6 py-3 text-sm font-semibold text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-gray-300 transition duration-150">
                             Cancel
@@ -1500,28 +1465,145 @@ if (!$included):
             </div>
         </div>
     </div>
-    
+   
     <script>
         let documentIndex = <?php echo count($documentList) > 0 ? count($documentList) : 1; ?>;
         const checklistOptions = <?php echo $flattenedChecklistJson; ?>;
-        
+       
+        // Function to find the two nearest valid values (tuned for ETB 2 decimals)
+        function findNearestValidValues(inputValue) {
+            const roundedValue = Math.round(inputValue * 100) / 100;  // To 2 decimals
+            const lowerValue = Math.max(0, roundedValue - 0.01).toFixed(2);
+            const higherValue = (roundedValue + 1e-10).toFixed(9);  // Tiny offset, 9 decimals
+            return [lowerValue, higherValue];
+        }
+       
+        // Function to show error message (updated to use nearest)
+        function showAmountError(message, nearest = null) {
+            const amountInput = document.getElementById('amount');
+            const amountGroup = amountInput.closest('.form-group');
+           
+            // Remove existing error
+            const existingError = amountGroup.querySelector('.amount-error-message');
+            if (existingError) existingError.remove();
+           
+            // Add error styling
+            amountInput.classList.add('amount-error');
+           
+            // Create error div
+            const errorDiv = document.createElement('div');
+            errorDiv.className = 'amount-error-message';
+            let fullMessage = message;
+            if (nearest) {
+                fullMessage += ` Please enter nearest value: the nearest values are ${nearest[0]} and ${nearest[1]}.`;
+            }
+            errorDiv.textContent = fullMessage;
+            amountGroup.appendChild(errorDiv);
+           
+            amountInput.focus();
+        }
+       
+        // Function to clear error message
+        function clearAmountError() {
+            const amountInput = document.getElementById('amount');
+            const amountGroup = amountInput.closest('.form-group');
+           
+            // Remove error styling
+            amountInput.classList.remove('amount-error');
+           
+            // Remove error message
+            const existingError = amountGroup.querySelector('.amount-error-message');
+            if (existingError) {
+                existingError.remove();
+            }
+        }
+       
+        // Updated validation: ≤2 decimals, suggest nearest if invalid
+        function validateAmountInput() {
+            const amountInput = document.getElementById('amount');
+            const amountValue = parseFloat(amountInput.value);
+           
+            clearAmountError();
+           
+            if (isNaN(amountValue) || amountValue <= 0) {
+                showAmountError('Please enter a valid positive amount.');
+                return false;
+            }
+           
+            // Check decimals ≤2
+            const decimals = (amountValue.toString().split('.')[1] || '').length;
+            if (decimals > 2) {
+                const nearest = findNearestValidValues(amountValue);
+                showAmountError('Please enter an amount with no more than 2 decimal places.', nearest);
+                return false;
+            }
+           
+            // Allow submission even if there's a precision drift error
+            // The server-side validation will handle this case
+            return true;
+        }
+       
+        // Add event listener to the form submit button
+        document.addEventListener('DOMContentLoaded', function() {
+            const form = document.querySelector('form');
+            const amountInput = document.getElementById('amount');
+           
+            if (form) {
+                form.addEventListener('submit', function(e) {
+                    // Only prevent submission for critical validation errors
+                    // Allow submission for precision drift warnings
+                    const amountValue = parseFloat(amountInput.value);
+                    if (isNaN(amountValue) || amountValue <= 0) {
+                        e.preventDefault();
+                        showAmountError('Please enter a valid positive amount.');
+                    } else {
+                        const decimals = (amountValue.toString().split('.')[1] || '').length;
+                        if (decimals > 2) {
+                            e.preventDefault();
+                            const nearest = findNearestValidValues(amountValue);
+                            showAmountError('Please enter an amount with no more than 2 decimal places.', nearest);
+                        }
+                    }
+                });
+            }
+           
+            // Real-time validation on blur/input for better UX
+            if (amountInput) {
+                amountInput.addEventListener('blur', function() {
+                    const amountValue = parseFloat(amountInput.value);
+                    if (!isNaN(amountValue) && amountValue > 0) {
+                        const decimals = (amountValue.toString().split('.')[1] || '').length;
+                        if (decimals > 2) {
+                            const nearest = findNearestValidValues(amountValue);
+                            showAmountError('Please enter an amount with no more than 2 decimal places.', nearest);
+                        }
+                    }
+                });
+                amountInput.addEventListener('input', function() {
+                    if (this.value !== '') {
+                        clearAmountError();
+                    }
+                });
+            }
+        });
+       
         function triggerFileUpload(button) {
             const fileInput = button.previousElementSibling;
             fileInput.click();
         }
-        
+       
         function addDocument() {
             const container = document.getElementById('documents-container');
             const documentItem = document.createElement('div');
             documentItem.className = 'document-item';
             documentItem.setAttribute('data-document-index', documentIndex);
-            
+           
             // Generate options for the select dropdown
             let optionsHtml = '';
             for (const [value, label] of Object.entries(checklistOptions)) {
                 optionsHtml += `<option value="${value}">${label}</option>`;
             }
-            
+           
             documentItem.innerHTML = `
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
@@ -1547,7 +1629,7 @@ if (!$included):
             container.appendChild(documentItem);
             documentIndex++;
         }
-        
+       
         function removeDocument(button) {
             const documentItem = button.closest('.document-item');
             if (document.getElementById('documents-container').children.length > 1) {
@@ -1564,13 +1646,13 @@ if (!$included):
                 });
             }
         }
-        
+       
         <?php if (!$included): ?>
         // Mobile sidebar toggle functionality for standalone page
         document.addEventListener('DOMContentLoaded', function() {
             const sidebar = document.getElementById('sidebar');
             const mobileMenuToggle = document.getElementById('mobileMenuToggle');
-            
+           
             // Toggle sidebar on hamburger menu click (mobile)
             if (mobileMenuToggle && sidebar) {
                 mobileMenuToggle.addEventListener('click', (e) => {
@@ -1578,11 +1660,11 @@ if (!$included):
                     sidebar.classList.toggle('-translate-x-full');
                 });
             }
-            
+           
             // Hide sidebar when clicking outside on mobile
             document.addEventListener('click', (event) => {
-                if (window.innerWidth < 1024 && sidebar && !sidebar.contains(event.target) && 
-                    mobileMenuToggle && !mobileMenuToggle.contains(event.target) && 
+                if (window.innerWidth < 1024 && sidebar && !sidebar.contains(event.target) &&
+                    mobileMenuToggle && !mobileMenuToggle.contains(event.target) &&
                     !sidebar.classList.contains('-translate-x-full')) {
                     sidebar.classList.add('-translate-x-full');
                 }
